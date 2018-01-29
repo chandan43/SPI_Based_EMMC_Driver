@@ -64,7 +64,159 @@ struct mmc_spi_host {
 	void			*ones;
 	dma_addr_t		ones_dma;
 };
+/* See Section 6.4.1, in SD "Simplified Physical Layer Specification 2.0"
+ *
+ * NOTE that here we can't know that the card has just been powered up;
+ * not all MMC/SD sockets support power switching.
+ *
+ * FIXME when the card is still in SPI mode, e.g. from a previous kernel,
+ * this doesn't seem to do the right thing at all...
+ */
+static void mmc_spi_initsequence(struct mmc_spi_host *host)
+{
+	/* Try to be very sure any previous command has completed;
+	 * wait till not-busy, skip debris from any old commands.
+	 */
+	mmc_spi_wait_unbusy(host, r1b_timeout);
+	mmc_spi_readbytes(host, 10);
+	/*
+	 * Do a burst with chipselect active-high.  We need to do this to
+	 * meet the requirement of 74 clock cycles with both chipselect
+	 * and CMD (MOSI) high before CMD0 ... after the card has been
+	 * powered up to Vdd(min), and so is ready to take commands.
+	 *
+	 * Some cards are particularly needy of this (e.g. Viking "SD256")
+	 * while most others don't seem to care.
+	 *
+	 * Note that this is one of the places MMC/SD plays games with the
+	 * SPI protocol.  Another is that when chipselect is released while
+	 * the card returns BUSY status, the clock must issue several cycles
+	 * with chipselect high before the card will stop driving its output.
+	 */
+	host->spi->mode |= SPI_CS_HIGH;
+	if (spi_setup(host->spi) != 0) {
+		/* Just warn; most cards work without it. */
+		dev_warn(&host->spi->dev,
+				"can't change chip-select polarity\n");
+		host->spi->mode &= ~SPI_CS_HIGH;
+	}else {
+		mmc_spi_readbytes(host, 18); //TODO
 
+		host->spi->mode &= ~SPI_CS_HIGH;
+		if (spi_setup(host->spi) != 0) {
+			/* Wot, we can't get the same setup we had before? */
+			dev_err(&host->spi->dev,
+					"can't restore chip-select polarity\n");
+		}
+	}
+}
+
+static  char *mmc_powerstring(u8 power_mode)
+{
+	switch (power_mode) {
+	case MMC_POWER_OFF: return "off";
+	case MMC_POWER_UP:  return "up";
+	case MMC_POWER_ON:  return "on";
+	}
+	return "?";
+}
+
+static void mmc_spi_set_ios(struct mmc_host *mmc, struct mmc_ios *ios)
+{
+	struct mmc_spi_host *host = mmc_priv(mmc);
+	if (host->power_mode != ios->power_mode) {
+		int		canpower;
+		canpower = host->pdata && host->pdata->setpower;
+		
+		dev_dbg(&host->spi->dev, "mmc_spi: power %s (%d)%s\n",
+				mmc_powerstring(ios->power_mode),
+				ios->vdd,
+				canpower ? ", can switch" : "");
+
+		/* switch power on/off if possible, accounting for
+		 * max 250msec powerup time if needed.
+		 */
+		if (canpower) {
+			switch (ios->power_mode) {
+			case MMC_POWER_OFF:
+			case MMC_POWER_UP:
+				host->pdata->setpower(&host->spi->dev,
+						ios->vdd);
+				if (ios->power_mode == MMC_POWER_UP)
+					msleep(host->powerup_msecs);
+			}
+		}
+		/* See 6.4.1 in the simplified SD card physical spec 2.0 */
+		if (ios->power_mode == MMC_POWER_ON)
+			mmc_spi_initsequence(host); //TODO:
+
+		/* If powering down, ground all card inputs to avoid power
+		 * delivery from data lines!  On a shared SPI bus, this
+		 * will probably be temporary; 6.4.2 of the simplified SD
+		 * spec says this must last at least 1msec.
+		 *
+		 *   - Clock low means CPOL 0, e.g. mode 0
+		 *   - MOSI low comes from writing zero
+		 *   - Chipselect is usually active low...
+		 */
+		if (canpower && ios->power_mode == MMC_POWER_OFF) {
+			int mres;
+			u8 nullbyte = 0;
+			host->spi->mode &= ~(SPI_CPOL|SPI_CPHA);
+			mres = spi_setup(host->spi);
+			if (mres < 0)
+				dev_dbg(&host->spi->dev,
+					"switch to SPI mode 0 failed\n");
+			if (spi_write(host->spi, &nullbyte, 1) < 0)
+				dev_dbg(&host->spi->dev,
+					"put spi signals to low failed\n");
+			/*
+			 * Now clock should be low due to spi mode 0;
+			 * MOSI should be low because of written 0x00;
+			 * chipselect should be low (it is active low)
+			 * power supply is off, so now MMC is off too!
+			 *
+			 * FIXME no, chipselect can be high since the
+			 * device is inactive and SPI_CS_HIGH is clear...
+			 */
+			msleep(10);
+			if (mres == 0) {
+				host->spi->mode |= (SPI_CPOL|SPI_CPHA);
+				mres = spi_setup(host->spi);
+				if (mres < 0)
+					dev_dbg(&host->spi->dev,
+						"switch back to SPI mode 3"
+						" failed\n");
+			}		
+		}	
+		host->power_mode = ios->power_mode; 	
+	}
+
+	if (host->spi->max_speed_hz != ios->clock && ios->clock != 0) {
+		int		status;
+
+		host->spi->max_speed_hz = ios->clock;
+		status = spi_setup(host->spi);
+		dev_dbg(&host->spi->dev,
+			"mmc_spi:  clock to %d Hz, %d\n",
+			host->spi->max_speed_hz, status);
+	}				
+}
+/*  .request : The upper MMC block  driver will send a struct mmc_request *mrq 
+ *  to do this. The mrq will include what want to do. When you finish the request 
+ *  you must call mmc_request_done() to note upper MMC block device driver what it is 
+ *  finished. There include command and data.
+ *
+ *  .set_ios : 
+ *  		1.Set/disable Clock.
+ *  		2.Power on/off to offer SD Card or not
+ *  		3.Set SD card width 1 or 4.
+ *  .get_ro :
+ *  		1.To check the SD card is write protect or not.
+ *
+ *  .get_cd : Card detection 
+ */
+ 
 static const struct mmc_host_ops mmc_spi_ops = {
 	.request	= mmc_spi_request,
 	.set_ios	= mmc_spi_set_ios,
