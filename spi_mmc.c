@@ -64,6 +64,106 @@ struct mmc_spi_host {
 	void			*ones;
 	dma_addr_t		ones_dma;
 };
+
+
+/****************************************************************************/
+/**
+ * spi_bus_lock - obtain a lock for exclusive SPI bus usage
+ * @master: SPI bus master that should be locked for exclusive bus access
+ * Context: can sleep
+ *
+ * This call may only be used from a context that may sleep.  The sleep
+ * is non-interruptible, and has no timeout.
+ *
+ * This call should be used by drivers that require exclusive access to the
+ * SPI bus. The SPI bus must be released by a spi_bus_unlock call when the
+ * exclusive access is over. Data transfer must be done by spi_sync_locked
+ * and spi_async_locked calls when the SPI bus lock is held.
+ *
+ * It returns zero on success, else a negative error code.
+ */
+/**
+ *	mmc_request_done - finish processing an MMC request
+ *	@host: MMC host which completed request
+ *	@mrq: MMC request which request
+ *
+ *	MMC drivers should call this function when they have completed
+ *	their processing of a request.
+ */
+/*
+ *  * MMC driver implementation -- the interface to the MMC stack
+ *   */
+
+static void mmc_spi_request(struct mmc_host *mmc, struct mmc_request *mrq)
+{
+	struct mmc_spi_host	*host = mmc_priv(mmc);
+	int			status = -EINVAL;
+	int			crc_retry = 5;
+	struct mmc_command	stop; 
+#ifdef DEBUG
+	/* MMC core and layered drivers *MUST* issue SPI-aware commands */
+	{
+		struct mmc_command	*cmd;
+		int			invalid = 0;
+
+		cmd = mrq->cmd;
+		if (!mmc_spi_resp_type(cmd)) {
+			dev_dbg(&host->spi->dev, "bogus command\n");
+			cmd->error = -EINVAL;
+			invalid = 1;
+		}
+
+		cmd = mrq->stop;
+		if (cmd && !mmc_spi_resp_type(cmd)) {
+			dev_dbg(&host->spi->dev, "bogus STOP command\n");
+			cmd->error = -EINVAL;
+			invalid = 1;
+		}
+
+		if (invalid) {
+			dump_stack();
+			mmc_request_done(host->mmc, mrq);
+			return;
+		}
+	}
+#endif
+	/* request exclusive bus access */
+	spi_bus_lock(host->spi->master);
+
+crc_recover:
+	/* issue command; then optionally data and stop */
+	status = mmc_spi_command_send(host, mrq, mrq->cmd, mrq->data != NULL);
+	if (status == 0 && mrq->data) {
+		mmc_spi_data_do(host, mrq->cmd, mrq->data, mrq->data->blksz);
+
+		/*
+		 * The SPI bus is not always reliable for large data transfers.
+		 * If an occasional crc error is reported by the SD device with
+		 * data read/write over SPI, it may be recovered by repeating
+		 * the last SD command again. The retry count is set to 5 to
+		 * ensure the driver passes stress tests.
+		 */
+		if (mrq->data->error == -EILSEQ && crc_retry) {
+			stop.opcode = MMC_STOP_TRANSMISSION;
+			stop.arg = 0;
+			stop.flags = MMC_RSP_SPI_R1B | MMC_RSP_R1B | MMC_CMD_AC;
+			status = mmc_spi_command_send(host, mrq, &stop, 0);
+			crc_retry--;
+			mrq->data->error = 0;
+			goto crc_recover;
+		}
+
+		if (mrq->stop)
+			status = mmc_spi_command_send(host, mrq, mrq->stop, 0);
+		else
+			mmc_cs_off(host);
+	}
+
+	/* release the bus */
+	spi_bus_unlock(host->spi->master);
+	
+	mmc_request_done(host->mmc, mrq);
+}
 /* See Section 6.4.1, in SD "Simplified Physical Layer Specification 2.0"
  *
  * NOTE that here we can't know that the card has just been powered up;
