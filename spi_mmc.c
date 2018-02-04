@@ -64,6 +64,114 @@ struct mmc_spi_host {
 	void			*ones;
 	dma_addr_t		ones_dma;
 };
+//TODO :-->mmc_spi_readblock
+/*
+ * Read one block:
+ *  - skip leading all-ones bytes ... either
+ *      + N(AC) [1..f(clock,CSD)] usually, else
+ *      + N(CX) [0..8] when reading CSD or CID
+ *  - data block
+ *	+ token ... if error token, no data or crc
+ *	+ data bytes
+ *	+ crc16
+ *
+ * After single block reads, we're done; N(EC) [0+] all-ones bytes follow
+ * before dropping chipselect.
+ *
+ * For multiblock reads, caller either reads the next block or issues a
+ * STOP_TRANSMISSION command.
+ */
+static int
+mmc_spi_readblock(struct mmc_spi_host *host, struct spi_transfer *t,
+	unsigned long timeout)
+{
+	struct spi_device	*spi = host->spi;
+	int			status;
+	struct scratch		*scratch = host->data;
+	unsigned int 		bitshift;
+	u8			leftover;
+	/* At least one SD card sends an all-zeroes byte when N(CX)
+	 * applies, before the all-ones bytes ... just cope with that.
+	 */
+	status = mmc_spi_readbytes(host, 1);  //TODO
+	if (status < 0)
+		return status;
+	status = scratch->status[0];
+	if (status == 0xff || status == 0)
+		status = mmc_spi_readtoken(host, timeout);  //TODO
+
+	if (status < 0) {
+		dev_dbg(&spi->dev, "read error %02x (%d)\n", status, status);
+		return status;
+	}
+	/* The token may be bit-shifted...
+	 * the first 0-bit precedes the data stream.
+	 */
+	bitshift = 7;
+	while (status & 0x80) {
+		status <<= 1;
+		bitshift--;
+	}
+	leftover = status << 1;
+	if (host->dma_dev) {
+		dma_sync_single_for_device(host->dma_dev,
+				host->data_dma, sizeof(*scratch),
+				DMA_BIDIRECTIONAL);
+		dma_sync_single_for_device(host->dma_dev,
+				t->rx_dma, t->len,
+				DMA_FROM_DEVICE);
+	}
+
+	status = spi_sync_locked(spi, &host->m);
+
+	if (host->dma_dev) {
+		dma_sync_single_for_cpu(host->dma_dev,
+				host->data_dma, sizeof(*scratch),
+				DMA_BIDIRECTIONAL);
+		dma_sync_single_for_cpu(host->dma_dev,
+				t->rx_dma, t->len,
+				DMA_FROM_DEVICE);
+	}
+	if (bitshift) {
+		/* Walk through the data and the crc and do
+		 * all the magic to get byte-aligned data.
+		 */
+		u8 *cp = t->rx_buf;
+		unsigned int len;
+		unsigned int bitright = 8 - bitshift;
+		u8 temp;
+		for (len = t->len; len; len--) {
+			temp = *cp;
+			*cp++ = leftover | (temp >> bitshift);
+			leftover = temp << bitright;
+		}
+		cp = (u8 *) &scratch->crc_val;
+		temp = *cp;
+		*cp++ = leftover | (temp >> bitshift);
+		leftover = temp << bitright;
+		temp = *cp;
+		*cp = leftover | (temp >> bitshift);
+	}
+
+	if (host->mmc->use_spi_crc) {
+		u16 crc = crc_itu_t(0, t->rx_buf, t->len);
+
+		be16_to_cpus(&scratch->crc_val);
+		if (scratch->crc_val != crc) {
+			dev_dbg(&spi->dev, "read - crc error: crc_val=0x%04x, "
+					"computed=0x%04x len=%d\n",
+					scratch->crc_val, crc, t->len);
+			return -EILSEQ;
+		}
+	}
+
+	t->rx_buf += t->len;
+	if (host->dma_dev)
+		t->rx_dma += t->len;
+
+	return 0;	
+
+}
 /**
  * list_add - add a new entry
  * @new: new entry to be added
