@@ -64,6 +64,100 @@ struct mmc_spi_host {
 	void			*ones;
 	dma_addr_t		ones_dma;
 };
+
+/* Build data message with up to four separate transfers.  For TX, we
+ * start by writing the data token.  And in most cases, we finish with
+ * a status transfer.
+ *
+ * We always provide TX data for data and CRC.  The MMC/SD protocol
+ * requires us to write ones; but Linux defaults to writing zeroes;
+ * so we explicitly initialize it to all ones on RX paths.
+ *
+ * We also handle DMA mapping, so the underlying SPI controller does
+ * not need to (re)do it for each message.
+ */
+static void
+mmc_spi_setup_data_message(
+	struct mmc_spi_host	*host,
+	int			multiple,
+	enum dma_data_direction	direction)
+{
+	struct spi_transfer	*t;
+	struct scratch		*scratch = host->data;
+	dma_addr_t		dma = host->data_dma;
+
+	spi_message_init(&host->m);
+	if (dma)
+		host->m.is_dma_mapped = 1;
+	if (direction == DMA_TO_DEVICE) {
+		t = &host->token;
+		memset(t, 0, sizeof(*t));
+		t->len = 1;
+		if (multiple)
+			scratch->data_token = SPI_TOKEN_MULTI_WRITE;
+		else
+			scratch->data_token = SPI_TOKEN_SINGLE;
+		t->tx_buf = &scratch->data_token;
+		if (dma)
+			t->tx_dma = dma + offsetof(struct scratch, data_token);
+		spi_message_add_tail(t, &host->m);
+	}
+	/* Body of transfer is buffer, then CRC ...
+	 * either TX-only, or RX with TX-ones.
+	 */
+	t = &host->t;
+	memset(t, 0, sizeof(*t));
+	t->tx_buf = host->ones;
+	t->tx_dma = host->ones_dma;
+	/* length and actual buffer info are written later */
+	spi_message_add_tail(t, &host->m);
+
+	t = &host->crc;
+	memset(t, 0, sizeof(*t));
+	t->len = 2;
+	if (direction == DMA_TO_DEVICE) {
+		/* the actual CRC may get written later */
+		t->tx_buf = &scratch->crc_val;
+		if (dma)
+			t->tx_dma = dma + offsetof(struct scratch, crc_val);
+	} else {
+		t->tx_buf = host->ones;
+		t->tx_dma = host->ones_dma;
+		t->rx_buf = &scratch->crc_val;
+		if (dma)
+			t->rx_dma = dma + offsetof(struct scratch, crc_val);
+	}
+	spi_message_add_tail(t, &host->m);
+	
+	/*
+	 * A single block read is followed by N(EC) [0+] all-ones bytes
+	 * before deselect ... don't bother.
+	 *
+	 * Multiblock reads are followed by N(AC) [1+] all-ones bytes before
+	 * the next block is read, or a STOP_TRANSMISSION is issued.  We'll
+	 * collect that single byte, so readblock() doesn't need to.
+	 *
+	 * For a write, the one-byte data response follows immediately, then
+	 * come zero or more busy bytes, then N(WR) [1+] all-ones bytes.
+	 * Then single block reads may deselect, and multiblock ones issue
+	 * the next token (next data block, or STOP_TRAN).  We can try to
+	 * minimize I/O ops by using a single read to collect end-of-busy.
+	 */
+	if (multiple || direction == DMA_TO_DEVICE) {
+		t = &host->early_status;
+		memset(t, 0, sizeof(*t));
+		t->len = (direction == DMA_TO_DEVICE)
+				? sizeof(scratch->status)
+				: 1;
+		t->tx_buf = host->ones;
+		t->tx_dma = host->ones_dma;
+		t->rx_buf = scratch->status;
+		if (dma)
+			t->rx_dma = dma + offsetof(struct scratch, status);
+		t->cs_change = 1;
+		spi_message_add_tail(t, &host->m);
+	}
+}
 //TODO :-->mmc_spi_readblock
 /*
  * Read one block:
@@ -154,7 +248,8 @@ mmc_spi_readblock(struct mmc_spi_host *host, struct spi_transfer *t,
 	}
 
 	if (host->mmc->use_spi_crc) {
-		u16 crc = crc_itu_t(0, t->rx_buf, t->len);
+		/* crc_itu_t — Compute the CRC-ITU-T for the data buffer: Returns the updated CRC value */
+		u16 crc = crc_itu_t(0, t->rx_buf, t->len); 
 
 		be16_to_cpus(&scratch->crc_val);
 		if (scratch->crc_val != crc) {
