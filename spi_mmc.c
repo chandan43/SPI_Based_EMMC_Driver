@@ -65,6 +65,83 @@ struct mmc_spi_host {
 	dma_addr_t		ones_dma;
 };
 
+/**
+ * crc_itu_t - Compute the CRC-ITU-T for the data buffer
+ *
+ * @crc:     previous CRC value
+ * @buffer:  data pointer
+ * @len:     number of bytes in the buffer
+ *
+ * Returns the updated CRC value
+ */
+/*
+ * Write one block:
+ *  - caller handled preceding N(WR) [1+] all-ones bytes
+ *  - data block
+ *	+ token
+ *	+ data bytes
+ *	+ crc16
+ *  - an all-ones byte ... card writes a data-response byte
+ *  - followed by N(EC) [0+] all-ones bytes, card writes zero/'busy'
+ *
+ * Return negative errno, else success.
+ */
+
+static int
+mmc_spi_writeblock(struct mmc_spi_host *host, struct spi_transfer *t,
+	unsigned long timeout)
+{
+	struct spi_device	*spi = host->spi;
+	int			status, i;
+	struct scratch		*scratch = host->data;
+	u32			pattern;
+	
+	/*To convert from the processor's native format into little-endian*/
+	if (host->mmc->use_spi_crc)
+		scratch->crc_val = cpu_to_be16(
+				crc_itu_t(0, t->tx_buf, t->len));
+	if (host->dma_dev)
+		dma_sync_single_for_device(host->dma_dev,
+				host->data_dma, sizeof(*scratch),
+				DMA_BIDIRECTIONAL);
+	status = spi_sync_locked(spi, &host->m);
+	if (status != 0) {
+		dev_dbg(&spi->dev, "write error (%d)\n", status);
+		return status;
+	}
+
+	if (host->dma_dev)
+		dma_sync_single_for_cpu(host->dma_dev,
+				host->data_dma, sizeof(*scratch),
+				DMA_BIDIRECTIONAL);
+	
+	
+	status = spi_sync_locked(spi, &host->m);
+
+	if (status != 0) {
+		dev_dbg(&spi->dev, "write error (%d)\n", status);
+		return status;
+	}
+
+	if (host->dma_dev)
+		dma_sync_single_for_cpu(host->dma_dev,
+				host->data_dma, sizeof(*scratch),
+				DMA_BIDIRECTIONAL);
+
+	/*
+	 * Get the transmission data-response reply.  It must follow
+	 * immediately after the data block we transferred.  This reply
+	 * doesn't necessarily tell whether the write operation succeeded;
+	 * it just says if the transmission was ok and whether *earlier*
+	 * writes succeeded; see the standard.
+	 *
+	 * In practice, there are (even modern SDHC-)cards which are late
+	 * in sending the response, and miss the time frame by a few bits,
+	 * so we have to cope with this situation and check the response
+	 * bit-by-bit. Arggh!!!
+	 */
+	
+}
 /* Build data message with up to four separate transfers.  For TX, we
  * start by writing the data token.  And in most cases, we finish with
  * a status transfer.
@@ -158,6 +235,7 @@ mmc_spi_setup_data_message(
 		spi_message_add_tail(t, &host->m);
 	}
 }
+
 //TODO :-->mmc_spi_readblock
 /*
  * Read one block:
