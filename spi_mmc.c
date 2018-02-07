@@ -64,83 +64,123 @@ struct mmc_spi_host {
 	void			*ones;
 	dma_addr_t		ones_dma;
 };
-
-/**
- * crc_itu_t - Compute the CRC-ITU-T for the data buffer
+/* Issue command and read its response.
+ * Returns zero on success, negative for error.
  *
- * @crc:     previous CRC value
- * @buffer:  data pointer
- * @len:     number of bytes in the buffer
- *
- * Returns the updated CRC value
+ * On error, caller must cope with mmc core retry mechanism.  That
+ * means immediate low-level resubmit, which affects the bus lock...
  */
-/*
- * Write one block:
- *  - caller handled preceding N(WR) [1+] all-ones bytes
- *  - data block
- *	+ token
- *	+ data bytes
- *	+ crc16
- *  - an all-ones byte ... card writes a data-response byte
- *  - followed by N(EC) [0+] all-ones bytes, card writes zero/'busy'
- *
- * Return negative errno, else success.
- */
-
 static int
-mmc_spi_writeblock(struct mmc_spi_host *host, struct spi_transfer *t,
-	unsigned long timeout)
+mmc_spi_command_send(struct mmc_spi_host *host,
+		struct mmc_request *mrq,
+		struct mmc_command *cmd, int cs_on)
 {
-	struct spi_device	*spi = host->spi;
-	int			status, i;
-	struct scratch		*scratch = host->data;
-	u32			pattern;
-	
-	/*To convert from the processor's native format into little-endian*/
-	if (host->mmc->use_spi_crc)
-		scratch->crc_val = cpu_to_be16(
-				crc_itu_t(0, t->tx_buf, t->len));
-	if (host->dma_dev)
-		dma_sync_single_for_device(host->dma_dev,
-				host->data_dma, sizeof(*scratch),
-				DMA_BIDIRECTIONAL);
-	status = spi_sync_locked(spi, &host->m);
-	if (status != 0) {
-		dev_dbg(&spi->dev, "write error (%d)\n", status);
-		return status;
-	}
+	struct scratch		*data = host->data;
+	u8			*cp = data->status;
+	int			status;
+	struct spi_transfer	*t;
 
-	if (host->dma_dev)
-		dma_sync_single_for_cpu(host->dma_dev,
-				host->data_dma, sizeof(*scratch),
-				DMA_BIDIRECTIONAL);
-	
-	
-	status = spi_sync_locked(spi, &host->m);
-
-	if (status != 0) {
-		dev_dbg(&spi->dev, "write error (%d)\n", status);
-		return status;
-	}
-
-	if (host->dma_dev)
-		dma_sync_single_for_cpu(host->dma_dev,
-				host->data_dma, sizeof(*scratch),
-				DMA_BIDIRECTIONAL);
-
-	/*
-	 * Get the transmission data-response reply.  It must follow
-	 * immediately after the data block we transferred.  This reply
-	 * doesn't necessarily tell whether the write operation succeeded;
-	 * it just says if the transmission was ok and whether *earlier*
-	 * writes succeeded; see the standard.
+	/* We can handle most commands (except block reads) in one full
+	 * duplex I/O operation before either starting the next transfer
+	 * (data block or command) or else deselecting the card.
 	 *
-	 * In practice, there are (even modern SDHC-)cards which are late
-	 * in sending the response, and miss the time frame by a few bits,
-	 * so we have to cope with this situation and check the response
-	 * bit-by-bit. Arggh!!!
+	 * First, write 7 bytes:
+	 *  - an all-ones byte to ensure the card is ready
+	 *  - opcode byte (plus start and transmission bits)
+	 *  - four bytes of big-endian argument
+	 *  - crc7 (plus end bit) ... always computed, it's cheap
+	 *
+	 * We init the whole buffer to all-ones, which is what we need
+	 * to write while we're reading (later) response data.
 	 */
+	memset(cp, 0xff, sizeof(data->status));
 	
+	cp[1] = 0x40 | cmd->opcode;
+	put_unaligned_be32(cmd->arg, cp+2);
+	cp[6] = crc7_be(0, cp+1, 5) | 0x01;
+	cp += 7;
+	/* Then, read up to 13 bytes (while writing all-ones):
+	 *  - N(CR) (== 1..8) bytes of all-ones
+	 *  - status byte (for all response types)
+	 *  - the rest of the response, either:
+	 *      + nothing, for R1 or R1B responses
+	 *	+ second status byte, for R2 responses
+	 *	+ four data bytes, for R3 and R7 responses
+	 *
+	 * Finally, read some more bytes ... in the nice cases we know in
+	 * advance how many, and reading 1 more is always OK:
+	 *  - N(EC) (== 0..N) bytes of all-ones, before deselect/finish
+	 *  - N(RC) (== 1..N) bytes of all-ones, before next command
+	 *  - N(WR) (== 1..N) bytes of all-ones, before data write
+	 *
+	 * So in those cases one full duplex I/O of at most 21 bytes will
+	 * handle the whole command, leaving the card ready to receive a
+	 * data block or new command.  We do that whenever we can, shaving
+	 * CPU and IRQ costs (especially when using DMA or FIFOs).
+	 *
+	 * There are two other cases, where it's not generally practical
+	 * to rely on a single I/O:
+	 *
+	 *  - R1B responses need at least N(EC) bytes of all-zeroes.
+	 *
+	 *    In this case we can *try* to fit it into one I/O, then
+	 *    maybe read more data later.
+	 *
+	 *  - Data block reads are more troublesome, since a variable
+	 *    number of padding bytes precede the token and data.
+	 *      + N(CX) (== 0..8) bytes of all-ones, before CSD or CID
+	 *      + N(AC) (== 1..many) bytes of all-ones
+	 *
+	 *    In this case we currently only have minimal speedups here:
+	 *    when N(CR) == 1 we can avoid I/O in response_get().
+	 */
+	 if (cs_on && (mrq->data->flags & MMC_DATA_READ)) {
+		cp += 2;	/* min(N(CR)) + status */
+		/* R1 */
+	} else {
+		cp += 10;	/* max(N(CR)) + status + min(N(RC),N(WR)) */
+		if (cmd->flags & MMC_RSP_SPI_S2)	/* R2/R5 */
+			cp++;
+		else if (cmd->flags & MMC_RSP_SPI_B4)	/* R3/R4/R7 */
+			cp += 4;
+		else if (cmd->flags & MMC_RSP_BUSY)	/* R1B */
+			cp = data->status + sizeof(data->status);
+		/* else:  R1 (most commands) */
+	}
+	dev_dbg(&host->spi->dev, "  mmc_spi: CMD%d, resp %s\n",
+		cmd->opcode, maptype(cmd));
+	
+	/* send command, leaving chipselect active */
+	spi_message_init(&host->m);
+
+	t = &host->t;
+	memset(t, 0, sizeof(*t));
+	t->tx_buf = t->rx_buf = data->status;
+	t->tx_dma = t->rx_dma = host->data_dma;
+	t->len = cp - data->status;
+	t->cs_change = 1;
+	spi_message_add_tail(t, &host->m);
+	
+	if (host->dma_dev) {
+		host->m.is_dma_mapped = 1;
+		dma_sync_single_for_device(host->dma_dev,
+				host->data_dma, sizeof(*host->data),
+				DMA_BIDIRECTIONAL);
+	}
+	status = spi_sync_locked(host->spi, &host->m);
+
+	if (host->dma_dev)
+		dma_sync_single_for_cpu(host->dma_dev,
+				host->data_dma, sizeof(*host->data),
+				DMA_BIDIRECTIONAL);
+	if (status < 0) {
+		dev_dbg(&host->spi->dev, "  ... write returned %d\n", status);
+		cmd->error = status;
+		return status;
+	}
+
+	/* after no-data commands and STOP_TRANSMISSION, chipselect off */
+	return mmc_spi_response_get(host, cmd, cs_on);	
 }
 /* Build data message with up to four separate transfers.  For TX, we
  * start by writing the data token.  And in most cases, we finish with
@@ -236,6 +276,132 @@ mmc_spi_setup_data_message(
 	}
 }
 
+/**
+ * crc_itu_t - Compute the CRC-ITU-T for the data buffer
+ *
+ * @crc:     previous CRC value
+ * @buffer:  data pointer
+ * @len:     number of bytes in the buffer
+ *
+ * Returns the updated CRC value
+ */
+/*
+ * Write one block:
+ *  - caller handled preceding N(WR) [1+] all-ones bytes
+ *  - data block
+ *	+ token
+ *	+ data bytes
+ *	+ crc16
+ *  - an all-ones byte ... card writes a data-response byte
+ *  - followed by N(EC) [0+] all-ones bytes, card writes zero/'busy'
+ *
+ * Return negative errno, else success.
+ */
+
+static int
+mmc_spi_writeblock(struct mmc_spi_host *host, struct spi_transfer *t,
+	unsigned long timeout)
+{
+	struct spi_device	*spi = host->spi;
+	int			status, i;
+	struct scratch		*scratch = host->data;
+	u32			pattern;
+	
+	/*To convert from the processor's native format into little-endian*/
+	if (host->mmc->use_spi_crc)
+		scratch->crc_val = cpu_to_be16(
+				crc_itu_t(0, t->tx_buf, t->len));
+	if (host->dma_dev)
+		dma_sync_single_for_device(host->dma_dev,
+				host->data_dma, sizeof(*scratch),
+				DMA_BIDIRECTIONAL);
+	status = spi_sync_locked(spi, &host->m);
+	if (status != 0) {
+		dev_dbg(&spi->dev, "write error (%d)\n", status);
+		return status;
+	}
+
+	if (host->dma_dev)
+		dma_sync_single_for_cpu(host->dma_dev,
+				host->data_dma, sizeof(*scratch),
+				DMA_BIDIRECTIONAL);
+	
+	
+	status = spi_sync_locked(spi, &host->m);
+
+	if (status != 0) {
+		dev_dbg(&spi->dev, "write error (%d)\n", status);
+		return status;
+	}
+
+	if (host->dma_dev)
+		dma_sync_single_for_cpu(host->dma_dev,
+				host->data_dma, sizeof(*scratch),
+				DMA_BIDIRECTIONAL);
+
+	/*
+	 * Get the transmission data-response reply.  It must follow
+	 * immediately after the data block we transferred.  This reply
+	 * doesn't necessarily tell whether the write operation succeeded;
+	 * it just says if the transmission was ok and whether *earlier*
+	 * writes succeeded; see the standard.
+	 *
+	 * In practice, there are (even modern SDHC-)cards which are late
+	 * in sending the response, and miss the time frame by a few bits,
+	 * so we have to cope with this situation and check the response
+	 * bit-by-bit. Arggh!!!
+	 */
+	 /*The get_unaligned_be32 function just converts four bytes from 
+	  * data(scratch->status) to an unsigned four byte integer with 
+	  * possible byte order adjustments.
+	  */
+	 pattern = get_unaligned_be32(scratch->status);
+	/* First 3 bit of pattern are undefined */
+	pattern |= 0xE0000000;
+	/* left-adjust to leading 0 bit */
+	while (pattern & 0x80000000)
+		pattern <<= 1;
+	/* right-adjust for pattern matching. Code is in bit 4..0 now. */
+	pattern >>= 27;
+	switch (pattern) {
+	case SPI_RESPONSE_ACCEPTED:
+		status = 0;
+		break;
+	case SPI_RESPONSE_CRC_ERR:
+		/* host shall then issue MMC_STOP_TRANSMISSION */
+		status = -EILSEQ;
+		break;
+	case SPI_RESPONSE_WRITE_ERR:
+		/* host shall then issue MMC_STOP_TRANSMISSION,
+		 * and should MMC_SEND_STATUS to sort it out
+		 */
+		status = -EIO;
+		break;
+	default:
+		status = -EPROTO;
+		break;
+	}
+	if (status != 0) {
+		dev_dbg(&spi->dev, "write error %02x (%d)\n",
+			scratch->status[0], status);
+		return status;
+	}
+
+	t->tx_buf += t->len;
+	if (host->dma_dev)
+		t->tx_dma += t->len;
+
+	/* Return when not busy.  If we didn't collect that status yet,
+	 * we'll need some more I/O.
+	 */
+	for (i = 4; i < sizeof(scratch->status); i++) {
+		/* card is non-busy if the most recent bit is 1 */
+		if (scratch->status[i] & 0x01)
+			return 0;
+	}
+	return mmc_spi_wait_unbusy(host, timeout);	
+
+}
 //TODO :-->mmc_spi_readblock
 /*
  * Read one block:
